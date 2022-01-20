@@ -38,11 +38,11 @@ def check_rate_limit(result):
     minute_rate_count = minute_rate.split(":")[0]
 
     if int(second_rate_count) >= 20:
-        LOGGER.info("Wating 1 second because of 1 second rate limit (20 per sec)...")
+        LOGGER.info("Wating 1 second because of rate limit (20 per sec)...")
         time.sleep(1)
 
     if int(minute_rate_count) >= 100:
-        LOGGER.info("Wating for 2 minutes because of 2 minutes rate limit (100 per 2min)...")
+        LOGGER.info("Wating for 2 minutes because rate limit (100 per 2min)...")
         time.sleep(120)
 
 
@@ -94,8 +94,6 @@ def get_summoner_history(puuid, count, end_timestamp=None):
 
     summoner_history = pd.DataFrame(columns=participant_keys)
 
-    # LOGGER.info(f"Try to send {len(matchid_list)} requests...")
-
     for matchid in matchid_list:
 
         match = requests.get(
@@ -138,12 +136,12 @@ def insert_datamodel(summoner_history):
     df = summoner_history.copy()
 
     df.columns = ["_".join(re.findall("[a-zA-Z][^A-Z]*", colname)).lower() for colname in df]
-    df["team"] = df.team_id.replace({100: "blue", 200: "red"})
+    df["team"] = df.team_id.replace({100: "Blue", 200: "Red"})
 
     match = df.filter(["match_id", "start_date", "queue_id"]).drop_duplicates()
     summoner = df.filter(["puuid", "summoner_name"]).drop_duplicates()
     champion = df.filter(["champion_id", "champion_name"]).drop_duplicates()
-    summoner_history = df.filter(["match_id", "puuid", "champion_id", "team_position", "team", "win"])
+    summoner_history = df.filter(["batch_id", "match_id", "puuid", "champion_id", "team_position", "team", "win"])
 
     LOGGER.info("Start data insertion in PostgreSQL database 'riot'...")
 
@@ -178,21 +176,28 @@ def insert_datamodel(summoner_history):
         dtype={"match_id": types.VARCHAR(30), "start_date": types.TIMESTAMP, "queue_id": types.NUMERIC(10, 1)},
     )
 
-    summoner_history.to_sql(
-        name="summoner_history",
-        con=ENGINE,
-        if_exists="append",
-        index=False,
-        method=partial(insert_on_conflict_do_nothing, conflict="match_id, puuid"),
-        dtype={
-            "puuid": types.VARCHAR(100),
-            "summoner_name": types.VARCHAR(20),
-            "champion_id": types.BIGINT,
-            "team_position": types.VARCHAR(10),
-            "team": types.VARCHAR(4),
-            "win": types.BOOLEAN,
-        },
-    )
+    try:
+        summoner_history.to_sql(
+            name="summoner_history",
+            con=ENGINE,
+            if_exists="append",
+            index=False,
+            method=partial(insert_on_conflict_do_nothing, conflict="match_id, puuid"),
+            dtype={
+                "puuid": types.VARCHAR(100),
+                "summoner_name": types.VARCHAR(20),
+                "champion_id": types.BIGINT,
+                "team_position": types.VARCHAR(10),
+                "team": types.VARCHAR(4),
+                "win": types.BOOLEAN,
+            },
+        )
+    except Exception:
+        print(champion)
+        print("\n")
+        print(summoner_history)
+        raise
+
     LOGGER.info("End of data insertion")
 
 
@@ -211,23 +216,26 @@ def select_summoner(default_summoner_name="XkabutoX"):
         )
         check_rate_limit(result)
         puuid = result.json()["puuid"]
-        LOGGER.info(f"Use default summoner name {default_summoner_name}")
+        LOGGER.info(f"Use default summoner name {default_summoner_name} as a starting point")
     else:
         puuid = result.values[0][0]
-        LOGGER.info(f"Random summoner: puuid = {puuid}")
+        LOGGER.info(f"Analyse history of random summoner: puuid = {puuid}")
 
     return puuid
 
 
 def main(history_depth=5):
-
-    LOGGER.info(f"Try to send {1 + history_depth + history_depth * (history_depth + 1) * 9} requests to riot api...")
-
+    """
+    First, get the match history of the analysed summoner (choosed randomly)
+    Then look for the last 5 games of every players encoutered in these games
+    """
     puuid = select_summoner()
 
-    summoner_history = get_summoner_history(puuid, history_depth)
-    # count + 1
+    LOGGER.info(
+        f"Try to send a maximun of {1 + history_depth + history_depth * (history_depth + 1) * 9} requests to riot api..."
+    )
 
+    summoner_history = get_summoner_history(puuid, history_depth)  # count + 1
     enemies_allies_encountered = summoner_history[["puuid", "startDate"]].query("puuid != @puuid").drop_duplicates()
 
     enemies_allies_history = [
@@ -236,9 +244,10 @@ def main(history_depth=5):
     ]  # count * (count + 1) * 9
 
     LOGGER.info("Received all responses")
-
     all_history = pd.concat([summoner_history, *enemies_allies_history])
+    all_history["batch_id"] = int(pd.Timestamp("today").timestamp())
 
+    LOGGER.info(f"Update summoner table for {puuid}")
     sql_update = f"update summoner set has_enemies_allies_history = true where puuid = '{puuid}'"
     ENGINE.execute(sql_update)
 
@@ -261,4 +270,5 @@ if __name__ == "__main__":
     else:
         LOGGER.info("Program ends successfully")
     finally:
+        LOGGER.info("-" * 150)
         ENGINE.dispose()
