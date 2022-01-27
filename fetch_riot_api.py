@@ -4,14 +4,16 @@ import logging.config
 import re
 import time
 from functools import partial
+from typing import Iterable, List
 
 import pandas as pd
 import psycopg2
 import requests
+import sqlalchemy
 from sqlalchemy import create_engine, types
 
 
-def initialize_logs():
+def initialize_logs() -> logging.Logger:
 
     log_path = "/mnt/c/Users/alexb/Desktop/Data science Python/riot/logs.log"
 
@@ -32,7 +34,7 @@ def initialize_kwargs() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def check_rate_limit(result):
+def check_rate_limit(result: requests.models.Response) -> None:
     second_rate, minute_rate = result.headers["X-App-Rate-Limit-Count"].split(",")
     second_rate_count = second_rate.split(":")[0]
     minute_rate_count = minute_rate.split(":")[0]
@@ -46,7 +48,7 @@ def check_rate_limit(result):
         time.sleep(120)
 
 
-def get_match_id_list_for_summoner(puuid, count, end_timestamp=None):
+def get_match_id_list_for_summoner(puuid: str, count: int, end_timestamp: pd.Timestamp = None):
 
     params_matchlist = {
         "api_key": kwargs.API_KEY,
@@ -68,7 +70,7 @@ def get_match_id_list_for_summoner(puuid, count, end_timestamp=None):
     return result.json()
 
 
-def get_summoner_history(puuid, count, end_timestamp=None):
+def get_summoner_history(puuid: str, count: int, end_timestamp: pd.Timestamp = None) -> pd.DataFrame:
 
     matchid_list = get_match_id_list_for_summoner(puuid, count, end_timestamp)
 
@@ -116,28 +118,33 @@ def get_summoner_history(puuid, count, end_timestamp=None):
 
         summoner_history = pd.concat([summoner_history, temp_summoner_history])
 
-    # LOGGER.info(f"Received {len(matchid_list)} responses")
-
     return summoner_history
 
 
-def insert_on_conflict_do_nothing(table, conn, keys, data_iter, conflict):
+def insert_on_conflict_do_nothing(
+    table: pd.io.sql.SQLTable, conn: sqlalchemy.engine.Engine, keys: List[str], data_iter: Iterable, conflict: str
+) -> None:
 
     columns = ", ".join(keys)
     sql = f"INSERT INTO {table.name}({columns}) VALUES %s ON CONFLICT ({conflict}) DO NOTHING"
 
-    cursor = conn.connection.cursor()
-    psycopg2.extras.execute_values(cursor, sql, list(data_iter))
-    cursor.close()
+    with conn.connection.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, list(data_iter))
 
 
-def insert_datamodel(summoner_history):
-
-    df = summoner_history.copy()
+def insert_datamodel(df: pd.DataFrame, puuid: str) -> None:
 
     df.columns = ["_".join(re.findall("[a-zA-Z][^A-Z]*", colname)).lower() for colname in df]
-    df["team"] = df.team_id.replace({100: "Blue", 200: "Red"})
 
+    df["team"] = df.team_id.replace({100: "Blue", 200: "Red"})
+    df["batch_id"] = int(pd.Timestamp("today").timestamp())
+
+    batch = (
+        df.filter(["batch_id", "puuid"])
+        .query(f"puuid=='{puuid}'")
+        .rename(columns={"puuid": "summoner_analysed"})
+        .drop_duplicates()
+    )
     match = df.filter(["match_id", "start_date", "queue_id"]).drop_duplicates()
     summoner = df.filter(["puuid", "summoner_name"]).drop_duplicates()
     champion = df.filter(["champion_id", "champion_name"]).drop_duplicates()
@@ -145,45 +152,56 @@ def insert_datamodel(summoner_history):
 
     LOGGER.info("Start data insertion in PostgreSQL database 'riot'...")
 
-    summoner.to_sql(
-        name="summoner",
-        con=ENGINE,
-        if_exists="append",
-        index=False,
-        method=partial(insert_on_conflict_do_nothing, conflict="puuid"),
-        dtype={"puuid": types.VARCHAR(100), "summoner_name": types.VARCHAR(20)},
-    )
+    with ENGINE.begin() as conn:
 
-    champion.to_sql(
-        name="champion",
-        con=ENGINE,
-        if_exists="append",
-        index=False,
-        method=partial(insert_on_conflict_do_nothing, conflict="champion_name"),
-        dtype={
-            "champion_id": types.BIGINT,
-            "champion_name": types.VARCHAR(20),
-            "has_enemies_allies_history": types.BOOLEAN,
-        },
-    )
+        batch.to_sql(
+            name="batch",
+            con=conn,
+            if_exists="append",
+            index=False,
+            method=partial(insert_on_conflict_do_nothing, conflict="batch_id, summoner_analysed"),
+            dtype={"batch_id": types.VARCHAR(100), "summoner_analysed": types.VARCHAR(20)},
+        )
 
-    match.to_sql(
-        name="match",
-        con=ENGINE,
-        if_exists="append",
-        index=False,
-        method=partial(insert_on_conflict_do_nothing, conflict="match_id"),
-        dtype={"match_id": types.VARCHAR(30), "start_date": types.TIMESTAMP, "queue_id": types.NUMERIC(10, 1)},
-    )
+        summoner.to_sql(
+            name="summoner",
+            con=conn,
+            if_exists="append",
+            index=False,
+            method=partial(insert_on_conflict_do_nothing, conflict="puuid"),
+            dtype={"puuid": types.VARCHAR(100), "summoner_name": types.VARCHAR(20)},
+        )
 
-    try:
+        champion.to_sql(
+            name="champion",
+            con=conn,
+            if_exists="append",
+            index=False,
+            method=partial(insert_on_conflict_do_nothing, conflict="champion_name"),
+            dtype={
+                "champion_id": types.BIGINT,
+                "champion_name": types.VARCHAR(20),
+                "is_summoner_analysed": types.BOOLEAN,
+            },
+        )
+
+        match.to_sql(
+            name="match",
+            con=conn,
+            if_exists="append",
+            index=False,
+            method=partial(insert_on_conflict_do_nothing, conflict="match_id"),
+            dtype={"match_id": types.VARCHAR(30), "start_date": types.TIMESTAMP, "queue_id": types.NUMERIC(10, 1)},
+        )
+
         summoner_history.to_sql(
             name="summoner_history",
-            con=ENGINE,
+            con=conn,
             if_exists="append",
             index=False,
             method=partial(insert_on_conflict_do_nothing, conflict="match_id, puuid"),
             dtype={
+                "batch_id": types.BIGINT,
                 "puuid": types.VARCHAR(100),
                 "summoner_name": types.VARCHAR(20),
                 "champion_id": types.BIGINT,
@@ -192,18 +210,16 @@ def insert_datamodel(summoner_history):
                 "win": types.BOOLEAN,
             },
         )
-    except Exception:
-        print(champion)
-        print("\n")
-        print(summoner_history)
-        raise
 
-    LOGGER.info("End of data insertion")
+        LOGGER.info("End of data insertion")
+
+        LOGGER.info(f"Update summoner table for {puuid}")
+        conn.execute(f"update summoner set is_summoner_analysed = true where puuid = '{puuid}'")
 
 
-def select_summoner(default_summoner_name="XkabutoX"):
+def select_summoner(default_summoner_name: str = "XkabutoX") -> str:
 
-    sql_query = "select puuid from summoner where has_enemies_allies_history is false order by random() limit 1"
+    sql_query = "select puuid from summoner where is_summoner_analysed is false order by random() limit 1"
 
     result = pd.read_sql(sql_query, con=ENGINE)
 
@@ -224,19 +240,22 @@ def select_summoner(default_summoner_name="XkabutoX"):
     return puuid
 
 
-def main(history_depth=5):
+def main(history_depth: int = 5) -> None:
     """
-    First, get the match history of the analysed summoner (choosed randomly)
-    Then look for the last 5 games of every players encoutered in these games
+    First, get the match history of the analysed summoner (choosen randomly or by default if first call)
+    Then fetch history of every players encoutered in these games with depth = history_depth
+    Save the data in a local postgres database
     """
-    puuid = select_summoner()
+    puuid_analysed = select_summoner()
 
     LOGGER.info(
-        f"Try to send a maximun of {1 + history_depth + history_depth * (history_depth + 1) * 9} requests to riot api..."
+        f"Sending a maximun of {1 + history_depth + history_depth * (history_depth + 1) * 9} requests to Riot API..."
     )
 
-    summoner_history = get_summoner_history(puuid, history_depth)  # count + 1
-    enemies_allies_encountered = summoner_history[["puuid", "startDate"]].query("puuid != @puuid").drop_duplicates()
+    summoner_history = get_summoner_history(puuid_analysed, history_depth)  # count + 1
+    enemies_allies_encountered = (
+        summoner_history[["puuid", "startDate"]].query("puuid != @puuid_analysed").drop_duplicates()
+    )
 
     enemies_allies_history = [
         get_summoner_history(puuid, history_depth, int(end_timestamp.timestamp()))
@@ -245,20 +264,17 @@ def main(history_depth=5):
 
     LOGGER.info("Received all responses")
     all_history = pd.concat([summoner_history, *enemies_allies_history])
-    all_history["batch_id"] = int(pd.Timestamp("today").timestamp())
 
-    LOGGER.info(f"Update summoner table for {puuid}")
-    sql_update = f"update summoner set has_enemies_allies_history = true where puuid = '{puuid}'"
-    ENGINE.execute(sql_update)
+    LOGGER.info(f"Bulk batch contains {all_history.shape[0]} lines")
 
-    insert_datamodel(all_history)
+    insert_datamodel(all_history, puuid_analysed)
 
 
 if __name__ == "__main__":
 
     kwargs = initialize_kwargs()
     LOGGER = initialize_logs()
-    ENGINE = create_engine(f"postgresql://postgres:{kwargs.DB_PASS}@localhost:5432/riot", encoding="utf8")
+    ENGINE = create_engine(f"postgresql+psycopg2://postgres:{kwargs.DB_PASS}@localhost:5432/riot", encoding="utf8")
 
     LOGGER.info("Program starting")
 
